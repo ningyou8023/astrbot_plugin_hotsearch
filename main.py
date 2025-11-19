@@ -1,6 +1,5 @@
 import asyncio
 import aiohttp
-import json
 import tempfile
 import os
 from pathlib import Path
@@ -76,13 +75,7 @@ class HotSearchPlugin(Star):
                         tmp.write(data)
                         tmp.close()
                         return {"image_path": tmp.name}
-                    if fmt == "json" and response.status == 200:
-                        try:
-                            data = await response.json(content_type=None)
-                        except Exception:
-                            text = await response.text()
-                            return {"json": {"raw": text}}
-                        return {"json": data}
+                    
                     if response.status == 200:
                         text = await response.text()
                         return {"text": text}
@@ -107,9 +100,6 @@ class HotSearchPlugin(Star):
                 os.unlink(result["image_path"])
             except Exception:
                 pass
-            return
-        if result.get("json") is not None:
-            yield event.plain_result(json.dumps(result["json"], ensure_ascii=False, indent=2))
             return
         if result.get("text") is not None:
             yield event.plain_result(result["text"])
@@ -204,7 +194,7 @@ class HotSearchPlugin(Star):
             "• 腾讯热搜\n"
             "• 头条热搜\n"
             "• 猫眼票房\n\n"
-            "各平台格式独立配置，可设置 json/text/image"
+            "各平台格式独立配置，可设置 text/image"
         )
         yield event.plain_result(text)
 
