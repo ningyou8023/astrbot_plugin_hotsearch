@@ -1,4 +1,4 @@
-# 实时热搜插件（astrbot_hotsearch）
+# 实时热搜插件（astrbot_plugin_hotsearch）
 
 ## 功能
 - 聚合抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房实时热搜
