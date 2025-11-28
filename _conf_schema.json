@@ -190,6 +190,26 @@
     "default": "image"
   }
   ,
+  "enable_quark": {
+    "description": "开启或关闭夸克热搜",
+    "type": "bool",
+    "default": true
+  },
+  "quark_api": {
+    "description": "夸克热搜API",
+    "type": "string",
+    "hint": "使用 https://api.nycnm.cn/API/quark.php 接口，参数 ?format=text/image",
+    "obvious_hint": true,
+    "default": "https://api.nycnm.cn/API/quark.php"
+  },
+  "quark_format": {
+    "description": "夸克接口返回格式",
+    "type": "string",
+    "hint": "支持 json/text/image 三种",
+    "options": ["text", "image"],
+    "default": "image"
+  }
+  ,
   "enable_maoyan": {
     "description": "开启或关闭猫眼票房",
     "type": "bool",

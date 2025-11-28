@@ -1,5 +1,5 @@
 name: astrbot_plugin_hotsearch
-desc: 实时热搜聚合插件，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房，指令无需参数，默认输出图片。
+desc: 实时热搜聚合插件，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克，指令无需参数，默认输出图片。
 help: |
   【指令】
   - 抖音热搜
@@ -10,8 +10,9 @@ help: |
   - 懂车帝热搜
   - 哔哩哔哩热搜
   - 头条热搜
+  - 夸克热搜
   - 猫眼票房
   - 热搜帮助
-version: v1.0.0
+version: v1.0.1
 author: 柠柚
 repo: https://github.com/ningyou8023/astrbot_plugin_hotsearch

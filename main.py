@@ -14,8 +14,8 @@ PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
 @register(
     "astrbot_hotsearch",
     "柠柚",
-    "实时热搜聚合，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房，输出图片或文本",
-    "1.0.0",
+    "实时热搜聚合，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克，输出图片或文本",
+    "1.0.1",
 )
 class HotSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -30,6 +30,7 @@ class HotSearchPlugin(Star):
         self.toutiao_api = getattr(config, "toutiao_api", "https://api.nycnm.cn/API/toutiao.php")
         self.maoyan_api = getattr(config, "maoyan_api", "https://api.nycnm.cn/API/maoyan.php")
         self.tencent_api = getattr(config, "tencent_api", "https://api.nycnm.cn/API/txxw.php")
+        self.quark_api = getattr(config, "quark_api", "https://api.nycnm.cn/API/quark.php")
 
         self.global_apikey = getattr(config, "api_key", "")
         self.enable_douyin = getattr(config, "enable_douyin", True)
@@ -42,6 +43,7 @@ class HotSearchPlugin(Star):
         self.enable_toutiao = getattr(config, "enable_toutiao", True)
         self.enable_maoyan = getattr(config, "enable_maoyan", True)
         self.enable_tencent = getattr(config, "enable_tencent", True)
+        self.enable_quark = getattr(config, "enable_quark", True)
         self.douyin_format = getattr(config, "douyin_format", "image")
         self.xhs_format = getattr(config, "xhs_format", "image")
         self.zhihu_format = getattr(config, "zhihu_format", "image")
@@ -54,6 +56,7 @@ class HotSearchPlugin(Star):
         self.maoyan_format = getattr(config, "maoyan_format", "image")
         self.maoyan_type = getattr(config, "maoyan_type", "all")
         self.tencent_format = getattr(config, "tencent_format", "image")
+        self.quark_format = getattr(config, "quark_format", "image")
         logger.info("实时热搜插件已初始化")
 
     async def _request_hotsearch(self, base_url: str, fmt: str, apikey: str, extra: dict | None = None, fmt_key: str = "format"):
@@ -152,6 +155,11 @@ class HotSearchPlugin(Star):
         async for r in self._handle(event, self.tencent_api, self.tencent_format, self.enable_tencent, "腾讯", fmt_key="type"):
             yield r
 
+    @filter.command("夸克热搜", alias={"夸克实时热搜", "夸克榜", "夸克"})
+    async def quark(self, event: AstrMessageEvent):
+        async for r in self._handle(event, self.quark_api, self.quark_format, self.enable_quark, "夸克"):
+            yield r
+
     @filter.command("猫眼票房", alias={"猫眼热搜", "猫眼榜", "猫眼"})
     async def maoyan(self, event: AstrMessageEvent):
         text = event.get_message_str() or ""
@@ -193,6 +201,7 @@ class HotSearchPlugin(Star):
             "• 哔哩哔哩热搜\n"
             "• 腾讯热搜\n"
             "• 头条热搜\n"
+            "• 夸克热搜\n"
             "• 猫眼票房\n\n"
             "各平台格式独立配置，可设置 text/image"
         )

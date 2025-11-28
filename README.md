@@ -1,7 +1,7 @@
 # 实时热搜插件（astrbot_plugin_hotsearch）
 
 ## 功能
-- 聚合抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房实时热搜
+- 聚合抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克实时热搜
 - 指令无需参数，默认返回图片（可改为 text）
 - 支持统一 apikey 与单接口独立 apikey
 - 每个接口可单独开启/关闭
@@ -16,6 +16,7 @@
 - 哔哩哔哩热搜
 - 腾讯热搜
 - 头条热搜
+- 夸克热搜
 - 猫眼票房
 - 热搜帮助
 
@@ -60,6 +61,10 @@
 - `enable_tencent`：开启或关闭腾讯热搜
 - `tencent_api`：腾讯接口地址（默认 `https://api.nycnm.cn/API/txxw.php`，使用 `type` 指定返回格式）
 - `tencent_format`：腾讯返回格式，`text|image`（默认 `image`）
+
+- `enable_quark`：开启或关闭夸克热搜
+- `quark_api`：夸克接口地址（默认 `https://api.nycnm.cn/API/quark.php`）
+- `quark_format`：夸克返回格式，`text|image`（默认 `image`）
 
 - `enable_maoyan`：开启或关闭猫眼票房
 - `maoyan_api`：猫眼接口地址（默认 `https://api.nycnm.cn/API/maoyan.php`）
