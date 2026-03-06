@@ -5,6 +5,31 @@
     "hint": "统一密钥，所有接口共享",
     "default": ""
   },
+  "groups": {
+    "description": "推送群组列表",
+    "type": "list",
+    "hint": "填入群组的唯一标识符（Platform:GroupMessage:ID）",
+    "default": []
+  },
+  "push_time": {
+    "description": "推送时间",
+    "type": "string",
+    "hint": "定时推送时间，支持多个时间点用逗号分隔，如: 08:00,12:00",
+    "default": ""
+  },
+  "push_items": {
+    "description": "定时推送内容",
+    "type": "list",
+    "hint": "选择要定时推送的热搜平台",
+    "options": [
+      "douyin", "xhs", "zhihu", "weibo", "baidu", "dcd", "bilibili", 
+      "toutiao", "tencent", "quark", "maoyan", "douban", "kr36", 
+      "cto51", "pojie52", "acfun", "csdn", "hellogithub", "miyoushe", 
+      "ifanr", "ithome", "juejin", "netease", "sina", "sspai", 
+      "thepaper", "weatheralarm", "weread", "yicai", "yystv"
+    ],
+    "default": ["weibo"]
+  },
   "timeout": {
     "description": "请求超时时间(秒)",
     "type": "int",

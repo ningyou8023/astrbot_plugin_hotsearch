@@ -33,6 +33,6 @@ help: |
   - 第一财经热搜
   - 游研社热搜
   - 热搜帮助
-version: v1.0.3
+version: v1.0.4
 author: 柠柚
 repo: https://github.com/ningyou8023/astrbot_plugin_hotsearch
