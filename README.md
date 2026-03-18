@@ -41,7 +41,7 @@
 - 热搜帮助
 
 ## 配置
-在 AstrBot 插件配置中填写以下项（已在 `_conf_schema.json` 定义，开关写法与 `astrbot_scheduler` 保持一致）：
+在 AstrBot 插件配置中填写以下项：
 
 - `api_key`：全局统一 API 密钥，所有接口共享（请到柠柚API https://api.nycnm.cn 注册账号获取）
 
@@ -169,6 +169,41 @@
 - `enable_yystv`：开启或关闭游研社热搜
 - `yystv_api`：游研社接口地址（默认 `https://api.nycnm.cn/API/yystv.php`）
 - `yystv_format`：游研社返回格式，`text|image`（默认 `image`）
+
+## 定时推送与群组配置说明
+
+- `groups`：接收定时推送的群组唯一标识符列表。
+- `push_time`：定时推送时间，格式 `HH:MM`，支持多个时间点（用英文或中文逗号分隔，如 `08:00,12:00`），留空则不推送。
+- `push_items`：选择要定时推送的热搜平台（如 `["weibo", "baidu"]`）。
+
+**群聊唯一标识符说明：**
+群聊唯一标识符分为: `前缀:中缀:后缀`
+
+下面是所有可选的群组唯一标识符前缀:
+| 平台                                | 群组唯一标识符前缀     |
+|-------------------------------------|------------------------|
+| qq, napcat, Lagrange 之类的         | aiocqhttp              |
+| qq 官方 bot                         | qq_official            |
+| telegram                            | telegram               |
+| 钉钉                                | dingtalk               |
+| wechatpadpro微信                    | wechatpadpro           |
+| gewechat 微信(虽然已经停止维护)     | gewechat               |
+| lark                                | lark                   |
+| qq webhook 方法                     | qq_official_webhook    |
+| astrbot 网页聊天界面                | webchat                |
+
+下面是所有可选的群组唯一标识符中缀:
+| 群组唯一标识符中缀   | 描述       |
+|----------------------|------------|
+| GroupMessage         | 群组消息   |
+| FriendMessage        | 私聊消息   |
+| OtherMessage         | 其他消息   |
+
+前缀为`机器人名称`，中缀为`GroupMessage`，后缀为`QQ群号或QQ号`
+最终组合结果类似：
+```text
+CoCo机器人:GroupMessage:QQ群号或QQ号
+```
 
 ## 依赖
 - `aiohttp`

@@ -18,7 +18,7 @@ PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
     "astrbot_hotsearch",
     "柠柚",
     "实时热搜聚合，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克/豆瓣/36氪/51CTO/52破解/AcFun/CSDN/HelloGitHub/米游社/爱范儿/IT之家/掘金/网易新闻/新浪新闻/少数派/澎湃新闻/气象预警/微信读书/第一财经/游研社，输出图片或文本",
-    "1.0.4",
+    "1.0.5",
 )
 class HotSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -293,11 +293,10 @@ class HotSearchPlugin(Star):
                 for group_id in self.groups:
                     try:
                         chain = MessageChain()
-                        chain.plain(f"【{name_cn}热搜】\n")
                         if result.get("image_path"):
-                            chain.file_image(result["image_path"])
+                            chain = chain.file_image(result["image_path"])
                         elif result.get("text"):
-                            chain.plain(result["text"])
+                            chain = chain.message(result["text"])
                         
                         await self.context.send_message(group_id, chain)
                         await asyncio.sleep(1) # 避免刷屏
