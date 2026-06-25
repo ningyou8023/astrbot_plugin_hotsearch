@@ -43,6 +43,12 @@
     ],
     "default": ["weibo"]
   },
+  "forward_message": {
+    "description": "以合并转发消息形式推送",
+    "type": "bool",
+    "hint": "开启后，多个平台的热搜将合并为一条转发消息推送，清爽不刷屏。需要机器人支持合并转发（如NapCat）。",
+    "default": false
+  },
   "timeout": {
     "description": "请求超时时间(秒)",
     "type": "int",

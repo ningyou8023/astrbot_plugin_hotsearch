@@ -2,17 +2,53 @@ import asyncio
 import aiohttp
 import tempfile
 import os
+import time
 import datetime
 import traceback
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_DATA_DIR = Path("data", "plugins_data", "astrbot_hotsearch")
 PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── 模块级共享状态 ──────────────────────────────────────────────
+# AstrBot 框架在配置变更/插件刷新时可能不调用 terminate() 就重新加载插件，
+# 导致多个 _daily_task 实例同时运行。下面的共享变量确保即使多实例并存，
+# 推送也受到跨实例的去重保护。
+# ────────────────────────────────────────────────────────────────
+import threading as _threading
+
+_shared_push_lock = _threading.Lock()
+_shared_last_push_time: float = 0.0       # 模块级上次推送时间戳(秒)
+_SHARED_MIN_PUSH_INTERVAL: float = 300.0  # 模块级冷却间隔(秒)
+_PUSH_WINDOW_TOLERANCE: float = 120.0     # 推送时间窗口容忍度(秒)，提前超过此值视为误唤醒
+
+# 持久化时间戳文件（防御 importlib.reload 后模块级变量丢失）
+def _get_persist_stamp_path() -> Path:
+    return PLUGIN_DATA_DIR / ".last_push_stamp"
+
+def _read_persisted_stamp() -> float:
+    """读取持久化时间戳，用于补充模块级变量的跨 reload 能力。"""
+    try:
+        p = _get_persist_stamp_path()
+        if p.exists():
+            return float(p.read_text().strip())
+    except Exception:
+        pass
+    return 0.0
+
+def _write_persisted_stamp(ts: float):
+    """写入持久化时间戳。"""
+    try:
+        _get_persist_stamp_path().write_text(str(ts))
+    except Exception:
+        pass
+
 
 class _CmdWrappedEvent:
     """包装原始 event，使 get_message_str 返回伪造的指令字符串，便于在 LLM Tool 中复用现有指令 handler。"""
@@ -33,7 +69,7 @@ class _CmdWrappedEvent:
     "astrbot_hotsearch",
     "柠柚",
     "实时热搜聚合，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克/豆瓣/36氪/51CTO/52破解/AcFun/CSDN/HelloGitHub/米游社/爱范儿/IT之家/掘金/网易新闻/新浪新闻/少数派/澎湃新闻/气象预警/微信读书/第一财经/游研社/财联社/快手/好游快爆，输出图片或文本",
-    "1.0.7",
+    "1.0.8",
 )
 class HotSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -145,6 +181,13 @@ class HotSearchPlugin(Star):
         self.groups = getattr(config, "groups", []) or []
         self.push_time = getattr(config, "push_time", "")
         self.push_items = getattr(config, "push_items", []) or []
+        self.forward_message = getattr(config, "forward_message", False)
+
+        # 任务控制：用于安全取消旧任务、防止并发推送
+        self._stop_event = asyncio.Event()
+        self._push_lock = asyncio.Lock()
+        self._last_push_time: float = 0.0  # 上次推送的时间戳(秒)
+        self._min_push_interval: float = 300.0  # 两次推送最小间隔5分钟
 
         logger.info("实时热搜插件已初始化")
         self._monitoring_task = asyncio.create_task(self._daily_task())
@@ -257,7 +300,7 @@ class HotSearchPlugin(Star):
         # 支持多个时间点，使用中文或英文逗号分隔
         time_strs = self.push_time.replace("，", ",").split(",")
         candidates = []
-        
+
         for t_str in time_strs:
             parts = t_str.strip().split(":")
             if len(parts) != 2:
@@ -265,51 +308,147 @@ class HotSearchPlugin(Star):
             try:
                 h, m = map(int, parts)
                 target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                if target <= now:
+                if target < now:  # 使用 < 而非 <=，同秒视为仍需推送
                     target += datetime.timedelta(days=1)
                 candidates.append(target)
             except ValueError:
                 continue
-        
+
         if not candidates:
             # 如果解析失败，返回 -1
             return -1.0
-            
+
         next_push = min(candidates)
         return (next_push - now).total_seconds()
 
-    async def _daily_task(self):
-        while True:
-            if not self.push_time:
-                await asyncio.sleep(60)
+    def _is_near_push_time(self) -> bool:
+        """
+        检查当前时间是否在任一配置推送时间 ± 容忍窗口内。
+        用于防御旧任务残留导致的提前唤醒。
+        """
+        now = datetime.datetime.now()
+        time_strs = self.push_time.replace("，", ",").split(",")
+        for t_str in time_strs:
+            parts = t_str.strip().split(":")
+            if len(parts) != 2:
                 continue
-            
+            try:
+                h, m = map(int, parts)
+                target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                diff = abs((now - target).total_seconds())
+                # 同时检查当天和昨天/明天的窗口（处理跨日边界）
+                if diff <= _PUSH_WINDOW_TOLERANCE:
+                    return True
+                if diff >= 86_400 - _PUSH_WINDOW_TOLERANCE:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        """
+        可被 _stop_event 提前唤醒的 sleep。
+        返回 True 表示正常超时，False 表示收到停止信号。
+        """
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+            return False  # stop_event 被设置
+        except asyncio.TimeoutError:
+            return True  # 正常超时
+
+    async def _daily_task(self):
+        """定时推送主循环（可安全取消）。"""
+        while not self._stop_event.is_set():
+            # 每次循环重新从 self 读取配置，支持热更新
+            if not self.push_time or not self.push_items or not self.groups:
+                if not await self._sleep_or_stop(60):
+                    break
+                continue
+
             try:
                 sleep_sec = self._calculate_sleep_time()
                 if sleep_sec < 0:
                     # 配置无效，等待一分钟再次检查
-                    await asyncio.sleep(60)
+                    if not await self._sleep_or_stop(60):
+                        break
                     continue
 
-                logger.info(f"[HotSearch] 下次推送将在 {sleep_sec} 秒后")
-                await asyncio.sleep(sleep_sec)
-                
+                logger.info(f"[HotSearch] 下次推送将在 {sleep_sec:.0f} 秒后 "
+                            f"(配置时间: {self.push_time}, 项目: {self.push_items})")
+
+                if not await self._sleep_or_stop(sleep_sec):
+                    break  # 收到停止信号
+
+                if self._stop_event.is_set():
+                    break
+
                 await self._push_to_groups()
-                
-                # 防止短时间内重复推送（确保跳过当前秒）
-                await asyncio.sleep(60)
+
+                # 防止短时间内重复推送（确保跳过当前分钟）
+                if not await self._sleep_or_stop(60):
+                    break
+
             except asyncio.CancelledError:
                 break
             except Exception:
                 traceback.print_exc()
-                await asyncio.sleep(60)
+                if self._stop_event.is_set():
+                    break
+                if not await self._sleep_or_stop(60):
+                    break
 
     async def _push_to_groups(self):
+        """定时推送（带防重复机制、推送时间窗口校验和跨实例去重保护）。"""
         if not self.groups or not self.push_items:
             return
-        
-        logger.info(f"[HotSearch] 开始定时推送: {self.push_items}")
-        
+
+        # ── 0. 推送时间窗口校验（防御旧任务残留导致的提前唤醒） ──
+        # 检查当前时间是否在配置的推送时间 ± 容忍窗口内。
+        # 如果差距过大，说明是被"幽灵任务"提前唤醒的，跳过并等待下次正常唤醒。
+        if not self._is_near_push_time():
+            now_dt = datetime.datetime.now()
+            logger.warning(
+                f"[HotSearch] ⚠️ 疑似旧任务残留导致提前/延迟唤醒："
+                f"当前 {now_dt.strftime('%H:%M:%S')} 不在推送时间窗口内"
+                f"（推送时间: {self.push_time}，容忍度: ±{_PUSH_WINDOW_TOLERANCE:.0f} 秒），跳过本次推送"
+            )
+            return
+
+        # ── 1. 跨实例去重：加锁 → 检查 → 标记 → 解锁 → 推送 ──
+        # "检查+标记"操作在锁内完成（微秒级），实际推送在锁外执行（可能分钟级）。
+        # 其他实例在锁内看到已标记的时间戳后会自动跳过，无需等待推送完成。
+        with _shared_push_lock:
+            now_ts = time.time()
+
+            # 1a. 模块级冷却期检查
+            if now_ts - _shared_last_push_time < _SHARED_MIN_PUSH_INTERVAL:
+                logger.warning(
+                    f"[HotSearch] 冷却期内：距上次推送仅 {now_ts - _shared_last_push_time:.0f} 秒，"
+                    f"少于 {_SHARED_MIN_PUSH_INTERVAL:.0f} 秒，跳过"
+                )
+                return
+
+            # 1b. 持久化时间戳检查（防御 importlib.reload 后模块级变量重置）
+            persisted = _read_persisted_stamp()
+            if now_ts - persisted < _SHARED_MIN_PUSH_INTERVAL:
+                _shared_last_push_time = max(_shared_last_push_time, persisted)
+                logger.warning(
+                    f"[HotSearch] 持久化冷却期内：距上次推送仅 {now_ts - persisted:.0f} 秒，跳过"
+                )
+                return
+
+            # ✅ 标记推送时间（在锁内，防止竞态）
+            _shared_last_push_time = now_ts
+            _write_persisted_stamp(now_ts)
+            self._last_push_time = now_ts
+
+        # ── 2. 实际推送（锁外，耗时操作不影响其他实例的去重判断） ──
+        logger.info(
+            f"[HotSearch] 开始定时推送: {self.push_items}，"
+            f"时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
+            f"模式: {'合并转发' if self.forward_message else '逐条发送'}"
+        )
+
         # 中文名映射
         NAME_CN_MAP = {
             "douyin": "抖音", "xhs": "小红书", "zhihu": "知乎", "weibo": "微博",
@@ -323,8 +462,19 @@ class HotSearchPlugin(Star):
             "yystv": "游研社", "cls": "财联社", "kuaishou": "快手", "hykb": "好游快爆"
         }
 
+        if self.forward_message:
+            await self._push_as_forward_message(NAME_CN_MAP)
+        else:
+            await self._push_per_item(NAME_CN_MAP)
+
+        logger.info(
+            f"[HotSearch] 定时推送完成，"
+            f"下次冷却期结束: {datetime.datetime.fromtimestamp(_shared_last_push_time + _SHARED_MIN_PUSH_INTERVAL).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    async def _push_per_item(self, NAME_CN_MAP: dict):
+        """逐条发送模式：每个平台独立推送一条消息。"""
         for item in self.push_items:
-            # 1. Get API URL and Format
             api_url = getattr(self, f"{item}_api", None)
             fmt = getattr(self, f"{item}_format", "image")
             name_cn = NAME_CN_MAP.get(item, item)
@@ -332,37 +482,32 @@ class HotSearchPlugin(Star):
             if not api_url:
                 continue
 
-            # 2. Handle Extra Params
+            # Handle Extra Params
             extra = {}
             if item == "baidu": extra = {"type": self.baidu_type}
             elif item == "maoyan": extra = {"type": self.maoyan_type}
-            elif item == "douban": extra = {"category": "movie"} # 默认电影
+            elif item == "douban": extra = {"category": "movie"}
             elif item == "kr36": extra = {"type": "hot"}
             elif item == "pojie52": extra = {"type": "hot"}
-            elif item == "acfun": extra = {"type": "-1"} # 综合
+            elif item == "acfun": extra = {"type": "-1"}
             elif item == "hellogithub": extra = {"type": "featured"}
-            elif item == "miyoushe": extra = {"game": "2", "type": "1"} # 原神公告
+            elif item == "miyoushe": extra = {"game": "2", "type": "1"}
             elif item == "ithome": extra = {"type": "hot"}
-            elif item == "juejin": extra = {"type": "1"} # 综合
+            elif item == "juejin": extra = {"type": "1"}
             elif item == "sina": extra = {"type": "all"}
             elif item == "sspai": extra = {"type": "hot"}
             elif item == "weread": extra = {"type": "rising"}
-            elif item == "weatheralarm": 
-                # 气象预警需要省份，定时推送无法提供，暂不推送或推全国（如果API支持空）
-                # 这里暂且跳过或传空
-                continue 
+            elif item == "weatheralarm":
+                continue
 
-            # 3. Handle Format Key
             fmt_key = "format"
             if item == "tencent": fmt_key = "type"
 
-            # 4. Request
             try:
                 result = await self._request_hotsearch(api_url, fmt, self.global_apikey, extra, fmt_key)
                 if not result:
                     continue
-                
-                # 5. Send to Groups
+
                 for group_id in self.groups:
                     try:
                         chain = MessageChain()
@@ -370,24 +515,121 @@ class HotSearchPlugin(Star):
                             chain = chain.file_image(result["image_path"])
                         elif result.get("text"):
                             chain = chain.message(result["text"])
-                        
+
                         await self.context.send_message(group_id, chain)
-                        await asyncio.sleep(1) # 避免刷屏
+                        await asyncio.sleep(1)
                     except Exception as e:
                         logger.error(f"推送 {item} 到 {group_id} 失败: {e}")
 
-                # 6. Cleanup
                 if result.get("image_path"):
                     try:
                         os.unlink(result["image_path"])
                     except:
                         pass
-                
-                # Platform interval
+
                 await asyncio.sleep(3)
 
             except Exception as e:
                 logger.error(f"定时推送 {item} 失败: {e}")
+
+    async def _push_as_forward_message(self, NAME_CN_MAP: dict):
+        """合并转发模式：将所有平台热搜打包为一条转发消息。"""
+        nodes: list[Node] = []
+        temp_image_paths: list[str] = []
+
+        # 用于转发消息节点的发送者 QQ 号（0 表示机器人自身）
+        BOT_UIN = "0"
+        # 单条文本最大长度（超过则截断）
+        MAX_TEXT_LEN = 4000
+
+        for item in self.push_items:
+            api_url = getattr(self, f"{item}_api", None)
+            name_cn = NAME_CN_MAP.get(item, item)
+
+            if not api_url:
+                continue
+
+            # Handle Extra Params
+            extra = {}
+            if item == "baidu": extra = {"type": self.baidu_type}
+            elif item == "maoyan": extra = {"type": self.maoyan_type}
+            elif item == "douban": extra = {"category": "movie"}
+            elif item == "kr36": extra = {"type": "hot"}
+            elif item == "pojie52": extra = {"type": "hot"}
+            elif item == "acfun": extra = {"type": "-1"}
+            elif item == "hellogithub": extra = {"type": "featured"}
+            elif item == "miyoushe": extra = {"game": "2", "type": "1"}
+            elif item == "ithome": extra = {"type": "hot"}
+            elif item == "juejin": extra = {"type": "1"}
+            elif item == "sina": extra = {"type": "all"}
+            elif item == "sspai": extra = {"type": "hot"}
+            elif item == "weread": extra = {"type": "rising"}
+            elif item == "weatheralarm":
+                continue
+
+            # 合并转发模式下，优先使用 text 格式获取内容
+            fmt_key = "format"
+            if item == "tencent": fmt_key = "type"
+
+            try:
+                # 先用用户配置的格式请求
+                user_fmt = getattr(self, f"{item}_format", "image")
+                result = await self._request_hotsearch(api_url, user_fmt, self.global_apikey, extra, fmt_key)
+                if not result:
+                    continue
+
+                node_chain = MessageChain()
+
+                if result.get("image_path"):
+                    # 图片结果：使用 Image 组件嵌入转发节点
+                    node_chain.chain.append(Image(file=result["image_path"]))
+                    temp_image_paths.append(result["image_path"])
+                elif result.get("text"):
+                    text_content = result["text"]
+                    if len(text_content) > MAX_TEXT_LEN:
+                        text_content = text_content[:MAX_TEXT_LEN - 3] + "..."
+                    # 为转发消息添加平台标题头
+                    node_chain.chain.append(Plain(text_content))
+
+                if not node_chain.chain:
+                    continue
+
+                nodes.append(Node(
+                    content=node_chain.chain,
+                    name=name_cn,
+                    uin=BOT_UIN,
+                ))
+
+            except Exception as e:
+                logger.error(f"转发消息构建 {item} 失败: {e}")
+
+        if not nodes:
+            logger.warning("[HotSearch] 转发消息无有效节点，跳过推送")
+            # 清理临时图片
+            for p in temp_image_paths:
+                try:
+                    os.unlink(p)
+                except:
+                    pass
+            return
+
+        forward_chain = MessageChain()
+        forward_chain.chain.append(Nodes(nodes=nodes))
+
+        for group_id in self.groups:
+            try:
+                await self.context.send_message(group_id, forward_chain)
+                logger.info(f"[HotSearch] 合并转发消息已推送到 {group_id}，包含 {len(nodes)} 个平台")
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"转发消息推送到 {group_id} 失败: {e}")
+
+        # 清理临时图片
+        for p in temp_image_paths:
+            try:
+                os.unlink(p)
+            except:
+                pass
 
     @filter.command("抖音热搜", alias={"抖音实时热搜", "抖音榜", "抖音热点", "抖音"})
     async def douyin(self, event: AstrMessageEvent):
@@ -883,6 +1125,15 @@ class HotSearchPlugin(Star):
         yield event.plain_result(text)
 
     async def terminate(self):
+        logger.info("实时热搜插件正在终止…")
+        # 1. 设置停止信号，让 _daily_task 中所有 _sleep_or_stop 提前返回
+        self._stop_event.set()
+        # 2. 取消后台任务
         if self._monitoring_task:
             self._monitoring_task.cancel()
+            try:
+                # 等待任务真正结束（而不是仅仅发送取消信号）
+                await asyncio.wait_for(self._monitoring_task, timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
         logger.info("实时热搜插件已终止")
