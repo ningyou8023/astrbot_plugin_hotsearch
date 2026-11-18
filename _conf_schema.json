@@ -26,15 +26,21 @@
   "push_time": {
     "description": "推送时间",
     "type": "string",
-    "hint": "定时推送时间，支持多个时间点用逗号分隔，如: 08:00,12:00",
+    "hint": "使用 AstrBot 服务所在环境的本地时间，支持逗号分隔多个时间点，如：08:00,12:00",
     "default": ""
+  },
+  "forward_message": {
+    "description": "定时推送使用合并转发",
+    "type": "bool",
+    "hint": "开启后，OneBot（aiocqhttp）群内将本次热搜合为一条转发消息，每个热搜平台占一个节点；其他平台仍逐条发送。",
+    "default": false
   },
   "push_items": {
     "description": "定时推送内容",
     "type": "list",
     "hint": "选择要定时推送的热搜平台",
     "options": [
-      "douyin", "xhs", "zhihu", "weibo", "baidu", "dcd", "bilibili", 
+      "douyin", "zhihu", "weibo", "baidu", "dcd", "bilibili", 
       "toutiao", "tencent", "quark", "maoyan", "douban", "kr36", 
       "cto51", "pojie52", "acfun", "csdn", "hellogithub", "miyoushe", 
       "ifanr", "ithome", "juejin", "netease", "sina", "sspai", 
@@ -63,25 +69,6 @@
   },
   "douyin_format": {
     "description": "抖音接口返回格式",
-    "type": "string",
-    "hint": "支持 text/image 两种",
-    "options": ["text", "image"],
-    "default": "image"
-  },
-  "enable_xhs": {
-    "description": "开启或关闭小红书热搜",
-    "type": "bool",
-    "default": true
-  },
-  "xhs_api": {
-    "description": "小红书热搜API",
-    "type": "string",
-    "hint": "使用 https://api.nycnm.cn/api/v2/xhsrs 接口，参数 ?format=text/image",
-    "obvious_hint": true,
-    "default": "https://api.nycnm.cn/api/v2/xhsrs"
-  },
-  "xhs_format": {
-    "description": "小红书接口返回格式",
     "type": "string",
     "hint": "支持 text/image 两种",
     "options": ["text", "image"],

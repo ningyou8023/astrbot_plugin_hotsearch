@@ -3,11 +3,13 @@ import aiohttp
 import tempfile
 import os
 import datetime
-import traceback
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Node, Nodes
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
 
@@ -32,14 +34,13 @@ class _CmdWrappedEvent:
 @register(
     "astrbot_hotsearch",
     "柠柚",
-    "实时热搜聚合，支持抖音/小红书/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克/豆瓣/36氪/51CTO/52破解/AcFun/CSDN/HelloGitHub/米游社/爱范儿/IT之家/掘金/网易新闻/新浪新闻/少数派/澎湃新闻/气象预警/微信读书/第一财经/游研社/财联社/快手/好游快爆，输出图片或文本",
-    "1.0.7",
+    "实时热搜聚合，支持抖音/知乎/微博/百度/懂车帝/哔哩哔哩/腾讯/头条/猫眼票房/夸克/豆瓣/36氪/51CTO/52破解/AcFun/CSDN/HelloGitHub/米游社/爱范儿/IT之家/掘金/网易新闻/新浪新闻/少数派/澎湃新闻/气象预警/微信读书/第一财经/游研社/财联社/快手/好游快爆，输出图片或文本",
+    "1.0.8",
 )
 class HotSearchPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
         self.douyin_api = getattr(config, "douyin_api", "https://api.nycnm.cn/api/v2/douyinrs")
-        self.xhs_api = getattr(config, "xhs_api", "https://api.nycnm.cn/api/v2/xhsrs")
         self.zhihu_api = getattr(config, "zhihu_api", "https://api.nycnm.cn/api/v2/zhihu")
         self.weibo_api = getattr(config, "weibo_api", "https://api.nycnm.cn/api/v2/wb")
         self.baidu_api = getattr(config, "baidu_api", "https://api.nycnm.cn/api/v2/baidu")
@@ -73,7 +74,6 @@ class HotSearchPlugin(Star):
         self.user_preference = getattr(config, "user_preference", "")
         self.timeout = getattr(config, "timeout", 30)
         self.enable_douyin = getattr(config, "enable_douyin", True)
-        self.enable_xhs = getattr(config, "enable_xhs", True)
         self.enable_zhihu = getattr(config, "enable_zhihu", True)
         self.enable_weibo = getattr(config, "enable_weibo", True)
         self.enable_baidu = getattr(config, "enable_baidu", True)
@@ -106,7 +106,6 @@ class HotSearchPlugin(Star):
         self.enable_kuaishou = getattr(config, "enable_kuaishou", True)
         self.enable_hykb = getattr(config, "enable_hykb", True)
         self.douyin_format = getattr(config, "douyin_format", "image")
-        self.xhs_format = getattr(config, "xhs_format", "image")
         self.zhihu_format = getattr(config, "zhihu_format", "image")
         self.weibo_format = getattr(config, "weibo_format", "image")
         self.baidu_format = getattr(config, "baidu_format", "image")
@@ -141,13 +140,26 @@ class HotSearchPlugin(Star):
         self.kuaishou_format = getattr(config, "kuaishou_format", "image")
         self.hykb_format = getattr(config, "hykb_format", "image")
         
-        # Scheduled Push Configs
-        self.groups = getattr(config, "groups", []) or []
-        self.push_time = getattr(config, "push_time", "")
-        self.push_items = getattr(config, "push_items", []) or []
+        self.groups = list(dict.fromkeys(getattr(config, "groups", []) or []))
+        self.push_time = getattr(config, "push_time", "") or ""
+        self.push_items = list(dict.fromkeys(getattr(config, "push_items", []) or []))
+        self.forward_message = getattr(config, "forward_message", False)
+        self._push_times = self._parse_push_times(self.push_time)
 
+        # 状态保存在事件循环上，插件模块重新导入后仍可找到旧任务和已触发时间。
+        loop = asyncio.get_running_loop()
+        state = getattr(loop, "_astrbot_hotsearch_schedule", None)
+        if state is None:
+            state = SimpleNamespace(task=None, lock=asyncio.Lock(), recent_slots={})
+            loop._astrbot_hotsearch_schedule = state
+        self._push_state = state
+        if state.task is not None:
+            state.task.cancel()
+        self._monitoring_task = None
+        if self._push_times and self.groups and self.push_items:
+            self._monitoring_task = loop.create_task(self._daily_task())
+        state.task = self._monitoring_task
         logger.info("实时热搜插件已初始化")
-        self._monitoring_task = asyncio.create_task(self._daily_task())
 
     async def _request_hotsearch(self, base_url: str, fmt: str, apikey: str, extra: dict | None = None, fmt_key: str = "format"):
         try:
@@ -249,70 +261,89 @@ class HotSearchPlugin(Star):
             yield event.plain_result(text_result)
             return
 
-    def _calculate_sleep_time(self) -> float:
-        """
-        计算距离下次推送的秒数
-        """
-        now = datetime.datetime.now()
-        # 支持多个时间点，使用中文或英文逗号分隔
-        time_strs = self.push_time.replace("，", ",").split(",")
-        candidates = []
-        
-        for t_str in time_strs:
-            parts = t_str.strip().split(":")
-            if len(parts) != 2:
+    @staticmethod
+    def _parse_push_times(push_time: str) -> set[tuple[int, int]]:
+        times = set()
+        for value in push_time.replace("，", ",").split(","):
+            value = value.strip()
+            if not value:
                 continue
             try:
-                h, m = map(int, parts)
-                target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                if target <= now:
-                    target += datetime.timedelta(days=1)
-                candidates.append(target)
-            except ValueError:
+                hour, minute = map(int, value.split(":"))
+                datetime.time(hour, minute)
+            except (ValueError, OverflowError):
+                logger.warning(f"[HotSearch] 忽略无效的推送时间: {value}")
                 continue
-        
-        if not candidates:
-            # 如果解析失败，返回 -1
-            return -1.0
-            
-        next_push = min(candidates)
-        return (next_push - now).total_seconds()
+            times.add((hour, minute))
+        return times
 
     async def _daily_task(self):
-        while True:
-            if not self.push_time:
-                await asyncio.sleep(60)
-                continue
-            
-            try:
-                sleep_sec = self._calculate_sleep_time()
-                if sleep_sec < 0:
-                    # 配置无效，等待一分钟再次检查
-                    await asyncio.sleep(60)
+        state = self._push_state
+        task = asyncio.current_task()
+        while state.task is task:
+            async with state.lock:
+                if state.task is not task:
+                    return
+                now = datetime.datetime.now()
+                slot = now.replace(second=0, microsecond=0)
+                if (slot.hour, slot.minute) in self._push_times and slot not in state.recent_slots:
+                    # 发送前占用本次时间点，防止同一分钟重载后再次推送。
+                    state.recent_slots[slot] = None
+                    if len(state.recent_slots) > 1440:
+                        del state.recent_slots[next(iter(state.recent_slots))]
+                    try:
+                        await self._push_to_groups()
+                    except Exception:
+                        logger.exception("[HotSearch] 定时推送失败")
                     continue
 
-                logger.info(f"[HotSearch] 下次推送将在 {sleep_sec} 秒后")
-                await asyncio.sleep(sleep_sec)
-                
-                await self._push_to_groups()
-                
-                # 防止短时间内重复推送（确保跳过当前秒）
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                traceback.print_exc()
-                await asyncio.sleep(60)
+            # 按系统时间复核到点情况，不依据上一次 sleep 的结束直接推送。
+            next_minute = slot + datetime.timedelta(minutes=1)
+            await asyncio.sleep((next_minute - now).total_seconds())
+
+    @staticmethod
+    def _remove_push_image(path: str):
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(f"[HotSearch] 清理定时推送临时图片失败: {exc}")
+
+    async def _send_push_chain(self, group_id: str, chain: MessageChain):
+        try:
+            if await self.context.send_message(group_id, chain) is False:
+                logger.warning(f"[HotSearch] 未向 {group_id} 发送定时推送，请检查会话标识和平台连接")
+        except Exception as exc:
+            # 发送结果不确定时不重发，避免平台实际已送达后再出现重复消息。
+            logger.error(f"[HotSearch] 定时推送到 {group_id} 失败: {exc}")
+        await asyncio.sleep(1)
+
+    async def _forward_sender(self, group_id: str) -> str | None:
+        platform_id, _, session = group_id.partition(":GroupMessage:")
+        if not platform_id or not session:
+            return None
+        try:
+            platform = self.context.get_platform_inst(platform_id)
+            if platform is None or platform.meta().name != "aiocqhttp":
+                return None
+            info = await asyncio.wait_for(
+                platform.get_client().call_action("get_login_info"), timeout=5
+            )
+            sender = str(info["user_id"])
+            return sender if sender.isdecimal() else None
+        except Exception as exc:
+            logger.warning(f"[HotSearch] 获取 {platform_id} 的合并转发发送者失败: {exc}")
+            return None
 
     async def _push_to_groups(self):
         if not self.groups or not self.push_items:
             return
         
-        logger.info(f"[HotSearch] 开始定时推送: {self.push_items}")
+        mode = "合并转发" if self.forward_message else "逐条发送"
+        logger.info(f"[HotSearch] 开始定时推送（{mode}）: {self.push_items}")
         
         # 中文名映射
         NAME_CN_MAP = {
-            "douyin": "抖音", "xhs": "小红书", "zhihu": "知乎", "weibo": "微博",
+            "douyin": "抖音", "zhihu": "知乎", "weibo": "微博",
             "baidu": "百度", "dcd": "懂车帝", "bilibili": "哔哩哔哩", "toutiao": "头条",
             "tencent": "腾讯", "quark": "夸克", "maoyan": "猫眼", "douban": "豆瓣",
             "kr36": "36氪", "cto51": "51CTO", "pojie52": "52破解", "acfun": "AcFun",
@@ -323,80 +354,68 @@ class HotSearchPlugin(Star):
             "yystv": "游研社", "cls": "财联社", "kuaishou": "快手", "hykb": "好游快爆"
         }
 
-        for item in self.push_items:
-            # 1. Get API URL and Format
-            api_url = getattr(self, f"{item}_api", None)
-            fmt = getattr(self, f"{item}_format", "image")
-            name_cn = NAME_CN_MAP.get(item, item)
+        entries = []
+        # 合并转发需要让图片存活到所有群发送完成；取消任务时同样清理。
+        with ExitStack() as images:
+            for item in self.push_items:
+                api_url = getattr(self, f"{item}_api", None)
+                if not api_url or item == "weatheralarm":
+                    continue
 
-            if not api_url:
-                continue
+                fmt = getattr(self, f"{item}_format", "image")
+                fmt_key = "type" if item == "tencent" else "format"
+                extra = {}
+                if item == "baidu": extra = {"type": self.baidu_type}
+                elif item == "maoyan": extra = {"type": self.maoyan_type}
+                elif item == "douban": extra = {"category": "movie"}
+                elif item == "kr36": extra = {"type": "hot"}
+                elif item == "pojie52": extra = {"type": "hot"}
+                elif item == "acfun": extra = {"type": "-1"}
+                elif item == "hellogithub": extra = {"type": "featured"}
+                elif item == "miyoushe": extra = {"game": "2", "type": "1"}
+                elif item == "ithome": extra = {"type": "hot"}
+                elif item == "juejin": extra = {"type": "1"}
+                elif item == "sina": extra = {"type": "all"}
+                elif item == "sspai": extra = {"type": "hot"}
+                elif item == "weread": extra = {"type": "rising"}
 
-            # 2. Handle Extra Params
-            extra = {}
-            if item == "baidu": extra = {"type": self.baidu_type}
-            elif item == "maoyan": extra = {"type": self.maoyan_type}
-            elif item == "douban": extra = {"category": "movie"} # 默认电影
-            elif item == "kr36": extra = {"type": "hot"}
-            elif item == "pojie52": extra = {"type": "hot"}
-            elif item == "acfun": extra = {"type": "-1"} # 综合
-            elif item == "hellogithub": extra = {"type": "featured"}
-            elif item == "miyoushe": extra = {"game": "2", "type": "1"} # 原神公告
-            elif item == "ithome": extra = {"type": "hot"}
-            elif item == "juejin": extra = {"type": "1"} # 综合
-            elif item == "sina": extra = {"type": "all"}
-            elif item == "sspai": extra = {"type": "hot"}
-            elif item == "weread": extra = {"type": "rising"}
-            elif item == "weatheralarm": 
-                # 气象预警需要省份，定时推送无法提供，暂不推送或推全国（如果API支持空）
-                # 这里暂且跳过或传空
-                continue 
-
-            # 3. Handle Format Key
-            fmt_key = "format"
-            if item == "tencent": fmt_key = "type"
-
-            # 4. Request
-            try:
                 result = await self._request_hotsearch(api_url, fmt, self.global_apikey, extra, fmt_key)
                 if not result:
                     continue
-                
-                # 5. Send to Groups
+                chain = MessageChain()
+                if image_path := result.get("image_path"):
+                    images.callback(self._remove_push_image, image_path)
+                    chain.file_image(image_path)
+                elif result.get("text"):
+                    chain.message(result["text"])
+                else:
+                    continue
+
+                if self.forward_message:
+                    entries.append((NAME_CN_MAP.get(item, item), chain))
+                else:
+                    for group_id in self.groups:
+                        await self._send_push_chain(group_id, chain)
+                    await asyncio.sleep(3)
+
+            if entries:
                 for group_id in self.groups:
-                    try:
-                        chain = MessageChain()
-                        if result.get("image_path"):
-                            chain = chain.file_image(result["image_path"])
-                        elif result.get("text"):
-                            chain = chain.message(result["text"])
-                        
-                        await self.context.send_message(group_id, chain)
-                        await asyncio.sleep(1) # 避免刷屏
-                    except Exception as e:
-                        logger.error(f"推送 {item} 到 {group_id} 失败: {e}")
+                    sender = await self._forward_sender(group_id)
+                    if sender is None:
+                        logger.info(f"[HotSearch] {group_id} 未使用合并转发，逐条发送")
+                        for _, chain in entries:
+                            await self._send_push_chain(group_id, chain)
+                        continue
 
-                # 6. Cleanup
-                if result.get("image_path"):
-                    try:
-                        os.unlink(result["image_path"])
-                    except:
-                        pass
-                
-                # Platform interval
-                await asyncio.sleep(3)
-
-            except Exception as e:
-                logger.error(f"定时推送 {item} 失败: {e}")
+                    nodes = [
+                        Node(name=name, uin=sender, content=chain.chain)
+                        for name, chain in entries
+                    ]
+                    await self._send_push_chain(group_id, MessageChain(chain=[Nodes(nodes=nodes)]))
 
     @filter.command("抖音热搜", alias={"抖音实时热搜", "抖音榜", "抖音热点", "抖音"})
     async def douyin(self, event: AstrMessageEvent):
         async for r in self._handle(event, self.douyin_api, self.douyin_format, self.enable_douyin, "抖音"):
-            yield r
-
-    @filter.command("小红书热搜", alias={"小红书实时热搜", "小红书榜", "小红书热点", "小红书"})
-    async def xhs(self, event: AstrMessageEvent):
-        async for r in self._handle(event, self.xhs_api, self.xhs_format, self.enable_xhs, "小红书"):
             yield r
 
     @filter.command("知乎热搜", alias={"知乎实时热搜", "知乎榜", "知乎热点", "知乎"})
@@ -725,7 +744,7 @@ class HotSearchPlugin(Star):
         if "总榜" in text or "all" in t: return "all"
         return "rising"
 
-    @filter.regex(r"(抖音|小红书|知乎|微博|百度|懂车帝|b站|哔哩哔哩|头条|腾讯|夸克|猫眼|豆瓣|36氪|51cto|52破解|acfun|a站|csdn|github|米游社|爱范儿|it之家|掘金|网易|新浪|少数派|澎湃|气象预警|微信读书|第一财经|游研社|财联社|快手|好游快爆).*(热搜|热点|热榜|榜单|新闻|有什么)", priority=999)
+    @filter.regex(r"(抖音|知乎|微博|百度|懂车帝|b站|哔哩哔哩|头条|腾讯|夸克|猫眼|豆瓣|36氪|51cto|52破解|acfun|a站|csdn|github|米游社|爱范儿|it之家|掘金|网易|新浪|少数派|澎湃|气象预警|微信读书|第一财经|游研社|财联社|快手|好游快爆).*(热搜|热点|热榜|榜单|新闻|有什么)", priority=999)
     async def natural_hotsearch_interceptor(self, event: AstrMessageEvent):
         """
         强行拦截自然语言提问（如“今日微博热搜”、“b站有什么热点”），
@@ -734,7 +753,7 @@ class HotSearchPlugin(Star):
         """
         text = (event.get_message_str() or "").lower()
         platforms = [
-            "抖音", "小红书", "知乎", "微博", "百度", "懂车帝", "哔哩哔哩", "b站",
+            "抖音", "知乎", "微博", "百度", "懂车帝", "哔哩哔哩", "b站",
             "头条", "腾讯", "夸克", "猫眼", "豆瓣", "36氪", "51cto", "52破解",
             "acfun", "a站", "csdn", "github", "米游社", "爱范儿", "it之家",
             "掘金", "网易", "新浪", "少数派", "澎湃", "气象预警", "微信读书",
@@ -765,7 +784,7 @@ class HotSearchPlugin(Star):
         任何只说不做的行为都是被严厉禁止的。请立即抛出工具调用。
         
         Args:
-            platform(string): 平台名称，必须是以下之一：抖音、小红书、知乎、微博、百度、懂车帝、哔哩哔哩、B站、头条、腾讯、夸克、猫眼、豆瓣、36氪、51CTO、52破解、AcFun、A站、CSDN、HelloGitHub、米游社、爱范儿、IT之家、掘金、网易新闻、新浪新闻、少数派、澎湃新闻、气象预警、微信读书、第一财经、游研社、财联社、快手、好游快爆。
+            platform(string): 平台名称，必须是以下之一：抖音、知乎、微博、百度、懂车帝、哔哩哔哩、B站、头条、腾讯、夸克、猫眼、豆瓣、36氪、51CTO、52破解、AcFun、A站、CSDN、HelloGitHub、米游社、爱范儿、IT之家、掘金、网易新闻、新浪新闻、少数派、澎湃新闻、气象预警、微信读书、第一财经、游研社、财联社、快手、好游快爆。
             extra_args(string): 附加参数，比如猫眼支持“电影/电视剧”、豆瓣支持“国内剧/美剧”等，没有则留空。
         """
         p = platform.lower()
@@ -774,8 +793,6 @@ class HotSearchPlugin(Star):
         
         if p in ["抖音"]:
             async for r in self.douyin(wrapped): yield r
-        elif p in ["小红书"]:
-            async for r in self.xhs(wrapped): yield r
         elif p in ["知乎"]:
             async for r in self.zhihu(wrapped): yield r
         elif p in ["微博"]:
@@ -847,7 +864,6 @@ class HotSearchPlugin(Star):
             "🔥 实时热搜插件\n\n"
             "【指令，无需参数】\n"
             "• 抖音热搜\n"
-            "• 小红书热搜\n"
             "• 知乎热搜\n"
             "• 微博热搜\n"
             "• 百度热搜\n"
@@ -883,6 +899,10 @@ class HotSearchPlugin(Star):
         yield event.plain_result(text)
 
     async def terminate(self):
-        if self._monitoring_task:
-            self._monitoring_task.cancel()
+        task = self._monitoring_task
+        if task is not None:
+            if self._push_state.task is task:
+                self._push_state.task = None
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         logger.info("实时热搜插件已终止")
